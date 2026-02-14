@@ -100,6 +100,28 @@ class PromptCachingDeploymentCheck(CustomLogger):
                 return deployment
         return None
 
+    @staticmethod
+    def _extract_model_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if payload is None:
+            return None
+
+        model_info = payload.get("model_info")
+        if isinstance(model_info, dict):
+            direct_model_id = model_info.get("id")
+            if isinstance(direct_model_id, str) and direct_model_id:
+                return direct_model_id
+
+        for nested_key in ("metadata", "litellm_metadata"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                nested_model_info = nested.get("model_info")
+                if isinstance(nested_model_info, dict):
+                    nested_model_id = nested_model_info.get("id")
+                    if isinstance(nested_model_id, str) and nested_model_id:
+                        return nested_model_id
+
+        return None
+
     async def _async_get_sticky_model_id(
         self, model: str, session_id: str
     ) -> Optional[str]:
@@ -139,6 +161,9 @@ class PromptCachingDeploymentCheck(CustomLogger):
                     healthy_deployments=healthy_deployments, model_id=sticky_model_id
                 )
                 if sticky_deployment is not None:
+                    await self._async_set_sticky_model_id(
+                        model=model, session_id=session_id, model_id=sticky_model_id
+                    )
                     return [sticky_deployment]
 
         if messages is not None and is_prompt_caching_valid_prompt(
@@ -200,6 +225,12 @@ class PromptCachingDeploymentCheck(CustomLogger):
                 "litellm.router_utils.pre_call_checks.prompt_caching_deployment_check: skipping adding model id to prompt caching cache, MESSAGES IS NOT A LIST"
             )
             return
+        if model_id is None:
+            model_id = self._extract_model_id(cast(Optional[Dict[str, Any]], kwargs))
+        if model_id is None:
+            model_id = self._extract_model_id(
+                {"metadata": standard_logging_object.get("metadata")}
+            )
         if model_id is None:
             verbose_logger.debug(
                 "litellm.router_utils.pre_call_checks.prompt_caching_deployment_check: skipping adding model id to prompt caching cache, MODEL ID IS NONE"
