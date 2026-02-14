@@ -2,6 +2,7 @@
 Wrapper around router cache. Meant to store model id when prompt caching supported prompt is called.
 """
 
+import copy
 import hashlib
 import json
 from typing import TYPE_CHECKING, Any, List, Optional, Union, cast
@@ -172,6 +173,77 @@ class PromptCachingCache:
         hashed_data = hashlib.sha256(data_to_hash_str.encode()).hexdigest()
         return f"deployment:{hashed_data}:prompt_caching"
 
+    @staticmethod
+    def _truncate_last_cacheable_unit(
+        cacheable_prefix: List[AllMessageValues],
+    ) -> List[AllMessageValues]:
+        """
+        Truncate one minimal cacheable unit from the tail of the cacheable prefix.
+
+        Behavior:
+        - If last message.content is a list with > 1 blocks, drop the last block.
+        - Else drop the last message.
+        """
+        if not cacheable_prefix:
+            return cacheable_prefix
+
+        truncated = copy.deepcopy(cacheable_prefix)
+        last_message = cast(dict, truncated[-1])
+        last_content = last_message.get("content")
+
+        if isinstance(last_content, list) and len(last_content) > 1:
+            last_message["content"] = last_content[:-1]
+            truncated[-1] = cast(AllMessageValues, last_message)
+            return cast(List[AllMessageValues], truncated)
+
+        return cast(List[AllMessageValues], truncated[:-1])
+
+    @staticmethod
+    def get_prompt_caching_candidate_keys(
+        messages: Optional[List[AllMessageValues]],
+        tools: Optional[List[ChatCompletionToolParam]],
+        max_backtrack: int = 20,
+    ) -> List[str]:
+        """
+        Build longest-prefix-first cache keys for lookup.
+
+        This allows requests with extended cacheable prefixes (e.g. ABCD) to
+        reuse an existing shorter-prefix route binding (e.g. ABC).
+        """
+        if messages is None and tools is None:
+            return []
+
+        if messages is None:
+            key = PromptCachingCache.get_prompt_caching_cache_key(messages=None, tools=tools)
+            return [key] if key is not None else []
+
+        cacheable_messages = PromptCachingCache.extract_cacheable_prefix(messages)
+        if not cacheable_messages:
+            return []
+
+        candidates: List[str] = []
+        seen = set()
+        current_prefix = copy.deepcopy(cacheable_messages)
+        steps = 0
+
+        while current_prefix and steps < max_backtrack:
+            key = PromptCachingCache.get_prompt_caching_cache_key(
+                messages=current_prefix,
+                tools=tools,
+            )
+            if key is not None and key not in seen:
+                seen.add(key)
+                candidates.append(key)
+
+            next_prefix = PromptCachingCache._truncate_last_cacheable_unit(current_prefix)
+            if len(next_prefix) == len(current_prefix):
+                break
+
+            current_prefix = next_prefix
+            steps += 1
+
+        return candidates
+
     def add_model_id(
         self,
         model_id: str,
@@ -227,14 +299,20 @@ class PromptCachingCache:
         if messages is None and tools is None:
             return None
 
-        # Generate cache key using cacheable prefix
-        cache_key = PromptCachingCache.get_prompt_caching_cache_key(messages, tools)
-        if cache_key is None:
+        candidate_keys = PromptCachingCache.get_prompt_caching_candidate_keys(
+            messages=messages,
+            tools=tools,
+            max_backtrack=20,
+        )
+        if not candidate_keys:
             return None
 
-        # Perform cache lookup
-        cache_result = await self.cache.async_get_cache(key=cache_key)
-        return cache_result
+        for cache_key in candidate_keys:
+            cache_result = await self.cache.async_get_cache(key=cache_key)
+            if cache_result is not None:
+                return cache_result
+
+        return None
 
     def get_model_id(
         self,
@@ -244,9 +322,17 @@ class PromptCachingCache:
         if messages is None and tools is None:
             return None
 
-        cache_key = PromptCachingCache.get_prompt_caching_cache_key(messages, tools)
-        # If no cacheable prefix found, return None (can't cache)
-        if cache_key is None:
+        candidate_keys = PromptCachingCache.get_prompt_caching_candidate_keys(
+            messages=messages,
+            tools=tools,
+            max_backtrack=20,
+        )
+        if not candidate_keys:
             return None
 
-        return self.cache.get_cache(cache_key)
+        for cache_key in candidate_keys:
+            cache_result = self.cache.get_cache(cache_key)
+            if cache_result is not None:
+                return cache_result
+
+        return None

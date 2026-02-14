@@ -9,7 +9,7 @@ from typing import List, Optional, cast
 from litellm import verbose_logger
 from litellm.caching.dual_cache import DualCache
 from litellm.integrations.custom_logger import CustomLogger, Span
-from litellm.types.llms.openai import AllMessageValues
+from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
 from litellm.types.utils import CallTypes, StandardLoggingPayload
 from litellm.utils import is_prompt_caching_valid_prompt
 
@@ -32,13 +32,19 @@ class PromptCachingDeploymentCheck(CustomLogger):
             messages=messages,
             model=model,
         ):  # prompt > 1024 tokens
+            tools: Optional[List[ChatCompletionToolParam]] = None
+            if request_kwargs is not None:
+                tools_from_request = request_kwargs.get("tools")
+                if isinstance(tools_from_request, list):
+                    tools = cast(List[ChatCompletionToolParam], tools_from_request)
+
             prompt_cache = PromptCachingCache(
                 cache=self.cache,
             )
 
             model_id_dict = await prompt_cache.async_get_model_id(
                 messages=cast(List[AllMessageValues], messages),
-                tools=None,
+                tools=tools,
             )
             if model_id_dict is not None:
                 model_id = model_id_dict["model_id"]
@@ -71,6 +77,10 @@ class PromptCachingDeploymentCheck(CustomLogger):
         model = standard_logging_object["model"]
         messages = standard_logging_object["messages"]
         model_id = standard_logging_object["model_id"]
+        tools: Optional[List[ChatCompletionToolParam]] = None
+        tools_from_kwargs = kwargs.get("tools")
+        if isinstance(tools_from_kwargs, list):
+            tools = cast(List[ChatCompletionToolParam], tools_from_kwargs)
 
         if messages is None or not isinstance(messages, list):
             verbose_logger.debug(
@@ -94,7 +104,7 @@ class PromptCachingDeploymentCheck(CustomLogger):
             await cache.async_add_model_id(
                 model_id=model_id,
                 messages=messages,
-                tools=None,  # [TODO]: add tools once standard_logging_object supports it
+                tools=tools,
             )
 
         return
