@@ -18,7 +18,8 @@ from ..prompt_caching_cache import PromptCachingCache
 
 
 class PromptCachingDeploymentCheck(CustomLogger):
-    STICKY_ROUTING_TTL_SECONDS = 300
+    AUTO_STICKY_ROUTING_TTL_SECONDS = 300
+    EXPLICIT_STICKY_ROUTING_TTL_SECONDS = 60 * 60 * 24 * 30
 
     def __init__(self, cache: DualCache):
         self.cache = cache
@@ -61,6 +62,12 @@ class PromptCachingDeploymentCheck(CustomLogger):
     @staticmethod
     def _get_sticky_cache_key(model: str, session_id: str) -> str:
         return f"deployment:{model}:session:{session_id}:sticky"
+
+    @staticmethod
+    def _get_sticky_ttl_seconds(session_id: str) -> int:
+        if session_id.startswith("auto-"):
+            return PromptCachingDeploymentCheck.AUTO_STICKY_ROUTING_TTL_SECONDS
+        return PromptCachingDeploymentCheck.EXPLICIT_STICKY_ROUTING_TTL_SECONDS
 
     @staticmethod
     def _extract_session_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -137,10 +144,11 @@ class PromptCachingDeploymentCheck(CustomLogger):
         self, model: str, session_id: str, model_id: str
     ) -> None:
         sticky_cache_key = self._get_sticky_cache_key(model=model, session_id=session_id)
+        sticky_ttl_seconds = self._get_sticky_ttl_seconds(session_id=session_id)
         await self.cache.async_set_cache(
             key=sticky_cache_key,
             value={"model_id": model_id},
-            ttl=self.STICKY_ROUTING_TTL_SECONDS,
+            ttl=sticky_ttl_seconds,
         )
 
     async def async_filter_deployments(
