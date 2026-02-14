@@ -18,8 +18,7 @@ from ..prompt_caching_cache import PromptCachingCache
 
 
 class PromptCachingDeploymentCheck(CustomLogger):
-    AUTO_STICKY_ROUTING_TTL_SECONDS = 300
-    EXPLICIT_STICKY_ROUTING_TTL_SECONDS = 60 * 60 * 24 * 30
+    STICKY_ROUTING_TTL_SECONDS = 300
 
     def __init__(self, cache: DualCache):
         self.cache = cache
@@ -65,9 +64,8 @@ class PromptCachingDeploymentCheck(CustomLogger):
 
     @staticmethod
     def _get_sticky_ttl_seconds(session_id: str) -> int:
-        if session_id.startswith("auto-"):
-            return PromptCachingDeploymentCheck.AUTO_STICKY_ROUTING_TTL_SECONDS
-        return PromptCachingDeploymentCheck.EXPLICIT_STICKY_ROUTING_TTL_SECONDS
+        _ = session_id
+        return PromptCachingDeploymentCheck.STICKY_ROUTING_TTL_SECONDS
 
     @staticmethod
     def _extract_session_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
