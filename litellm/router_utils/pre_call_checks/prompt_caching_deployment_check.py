@@ -34,6 +34,8 @@ class PromptCachingDeploymentCheck(CustomLogger):
             "user",
             "user_id",
             "end_user",
+            "user_api_key_hash",
+            "user_api_key_token",
             "user_api_key_alias",
             "user_api_key_user_id",
             "user_api_key_team_id",
@@ -205,6 +207,10 @@ class PromptCachingDeploymentCheck(CustomLogger):
             return
 
         session_id = self._extract_session_id(cast(Optional[Dict[str, Any]], kwargs))
+        if session_id is None:
+            standard_metadata = standard_logging_object.get("metadata")
+            if isinstance(standard_metadata, dict):
+                session_id = self._extract_session_id({"metadata": standard_metadata})
         if session_id is not None:
             await self._async_set_sticky_model_id(
                 model=model, session_id=session_id, model_id=model_id
