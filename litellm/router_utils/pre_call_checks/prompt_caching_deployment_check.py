@@ -4,6 +4,7 @@ Check if prompt caching is valid for a given deployment
 Route to previously cached model id, if valid
 """
 
+import hashlib
 from typing import Any, Dict, List, Optional, cast
 
 from litellm import verbose_logger
@@ -21,6 +22,39 @@ class PromptCachingDeploymentCheck(CustomLogger):
 
     def __init__(self, cache: DualCache):
         self.cache = cache
+
+    @staticmethod
+    def _get_auto_session_id(source_identifier: str) -> str:
+        source_hash = hashlib.sha256(source_identifier.encode("utf-8")).hexdigest()[:24]
+        return f"auto-{source_hash}"
+
+    @staticmethod
+    def _extract_source_identifier(payload: Dict[str, Any]) -> Optional[str]:
+        source_candidates = (
+            "user",
+            "user_id",
+            "end_user",
+            "user_api_key_alias",
+            "user_api_key_user_id",
+            "user_api_key_team_id",
+            "user_api_key",
+            "api_key",
+        )
+
+        for source_key in source_candidates:
+            source_value = payload.get(source_key)
+            if isinstance(source_value, str) and source_value.strip():
+                return f"top:{source_key}:{source_value.strip()}"
+
+        for nested_key in ("metadata", "litellm_metadata"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                for source_key in source_candidates:
+                    source_value = nested.get(source_key)
+                    if isinstance(source_value, str) and source_value.strip():
+                        return f"{nested_key}:{source_key}:{source_value.strip()}"
+
+        return None
 
     @staticmethod
     def _get_sticky_cache_key(model: str, session_id: str) -> str:
@@ -43,6 +77,14 @@ class PromptCachingDeploymentCheck(CustomLogger):
                     nested_value = nested.get(session_key)
                     if isinstance(nested_value, str) and nested_value.strip():
                         return nested_value.strip()
+
+        source_identifier = PromptCachingDeploymentCheck._extract_source_identifier(
+            payload=payload
+        )
+        if source_identifier is not None:
+            return PromptCachingDeploymentCheck._get_auto_session_id(
+                source_identifier=source_identifier
+            )
 
         return None
 
