@@ -4,7 +4,7 @@ Check if prompt caching is valid for a given deployment
 Route to previously cached model id, if valid
 """
 
-from typing import List, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 
 from litellm import verbose_logger
 from litellm.caching.dual_cache import DualCache
@@ -17,8 +17,65 @@ from ..prompt_caching_cache import PromptCachingCache
 
 
 class PromptCachingDeploymentCheck(CustomLogger):
+    STICKY_ROUTING_TTL_SECONDS = 300
+
     def __init__(self, cache: DualCache):
         self.cache = cache
+
+    @staticmethod
+    def _get_sticky_cache_key(model: str, session_id: str) -> str:
+        return f"deployment:{model}:session:{session_id}:sticky"
+
+    @staticmethod
+    def _extract_session_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
+        if payload is None:
+            return None
+
+        for direct_key in ("session_id", "conversation_id", "thread_id"):
+            direct_value = payload.get(direct_key)
+            if isinstance(direct_value, str) and direct_value.strip():
+                return direct_value.strip()
+
+        for nested_key in ("metadata", "litellm_metadata"):
+            nested = payload.get(nested_key)
+            if isinstance(nested, dict):
+                for session_key in ("session_id", "conversation_id", "thread_id"):
+                    nested_value = nested.get(session_key)
+                    if isinstance(nested_value, str) and nested_value.strip():
+                        return nested_value.strip()
+
+        return None
+
+    @staticmethod
+    def _get_deployment_by_model_id(
+        healthy_deployments: List[dict], model_id: str
+    ) -> Optional[dict]:
+        for deployment in healthy_deployments:
+            deployment_model_id = deployment.get("model_info", {}).get("id")
+            if deployment_model_id == model_id:
+                return deployment
+        return None
+
+    async def _async_get_sticky_model_id(
+        self, model: str, session_id: str
+    ) -> Optional[str]:
+        sticky_cache_key = self._get_sticky_cache_key(model=model, session_id=session_id)
+        sticky_result = await self.cache.async_get_cache(key=sticky_cache_key)
+        if isinstance(sticky_result, dict):
+            sticky_model_id = sticky_result.get("model_id")
+            if isinstance(sticky_model_id, str) and sticky_model_id:
+                return sticky_model_id
+        return None
+
+    async def _async_set_sticky_model_id(
+        self, model: str, session_id: str, model_id: str
+    ) -> None:
+        sticky_cache_key = self._get_sticky_cache_key(model=model, session_id=session_id)
+        await self.cache.async_set_cache(
+            key=sticky_cache_key,
+            value={"model_id": model_id},
+            ttl=self.STICKY_ROUTING_TTL_SECONDS,
+        )
 
     async def async_filter_deployments(
         self,
@@ -28,6 +85,18 @@ class PromptCachingDeploymentCheck(CustomLogger):
         request_kwargs: Optional[dict] = None,
         parent_otel_span: Optional[Span] = None,
     ) -> List[dict]:
+        session_id = self._extract_session_id(cast(Optional[Dict[str, Any]], request_kwargs))
+        if session_id is not None:
+            sticky_model_id = await self._async_get_sticky_model_id(
+                model=model, session_id=session_id
+            )
+            if sticky_model_id is not None:
+                sticky_deployment = self._get_deployment_by_model_id(
+                    healthy_deployments=healthy_deployments, model_id=sticky_model_id
+                )
+                if sticky_deployment is not None:
+                    return [sticky_deployment]
+
         if messages is not None and is_prompt_caching_valid_prompt(
             messages=messages,
             model=model,
@@ -92,6 +161,12 @@ class PromptCachingDeploymentCheck(CustomLogger):
                 "litellm.router_utils.pre_call_checks.prompt_caching_deployment_check: skipping adding model id to prompt caching cache, MODEL ID IS NONE"
             )
             return
+
+        session_id = self._extract_session_id(cast(Optional[Dict[str, Any]], kwargs))
+        if session_id is not None:
+            await self._async_set_sticky_model_id(
+                model=model, session_id=session_id, model_id=model_id
+            )
 
         ## PROMPT CACHING - cache model id, if prompt caching valid prompt + provider
         if is_prompt_caching_valid_prompt(
