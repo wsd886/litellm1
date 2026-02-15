@@ -5,6 +5,8 @@ Route to previously cached model id, if valid
 """
 
 import hashlib
+import random
+import time
 from typing import Any, Dict, List, Optional, cast
 
 from litellm import verbose_logger
@@ -56,11 +58,36 @@ class PromptCachingDeploymentCheck(CustomLogger):
                     if isinstance(source_value, str) and source_value.strip():
                         return f"{nested_key}:{source_key}:{source_value.strip()}"
 
+        # fallback: proxy request body
+        proxy_server_request = payload.get("proxy_server_request")
+        if isinstance(proxy_server_request, dict):
+            body = proxy_server_request.get("body")
+            if isinstance(body, dict):
+                for source_key in source_candidates:
+                    source_value = body.get(source_key)
+                    if isinstance(source_value, str) and source_value.strip():
+                        return f"proxy_server_request:body:{source_key}:{source_value.strip()}"
+
+        litellm_params = payload.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            proxy_server_request = litellm_params.get("proxy_server_request")
+            if isinstance(proxy_server_request, dict):
+                body = proxy_server_request.get("body")
+                if isinstance(body, dict):
+                    for source_key in source_candidates:
+                        source_value = body.get(source_key)
+                        if isinstance(source_value, str) and source_value.strip():
+                            return f"litellm_params:proxy_server_request:body:{source_key}:{source_value.strip()}"
+
         return None
 
     @staticmethod
     def _get_sticky_cache_key(model: str, session_id: str) -> str:
         return f"deployment:{model}:session:{session_id}:sticky"
+
+    @staticmethod
+    def _get_session_sticky_cache_key(session_id: str) -> str:
+        return f"deployment:session:{session_id}:sticky"
 
     @staticmethod
     def _get_sticky_ttl_seconds(session_id: str) -> int:
@@ -84,6 +111,41 @@ class PromptCachingDeploymentCheck(CustomLogger):
                     nested_value = nested.get(session_key)
                     if isinstance(nested_value, str) and nested_value.strip():
                         return nested_value.strip()
+
+        # fallback: proxy request body
+        proxy_server_request = payload.get("proxy_server_request")
+        if isinstance(proxy_server_request, dict):
+            body = proxy_server_request.get("body")
+            if isinstance(body, dict):
+                for session_key in ("session_id", "conversation_id", "thread_id"):
+                    nested_value = body.get(session_key)
+                    if isinstance(nested_value, str) and nested_value.strip():
+                        return nested_value.strip()
+                for nested_key in ("metadata", "litellm_metadata"):
+                    nested = body.get(nested_key)
+                    if isinstance(nested, dict):
+                        for session_key in ("session_id", "conversation_id", "thread_id"):
+                            nested_value = nested.get(session_key)
+                            if isinstance(nested_value, str) and nested_value.strip():
+                                return nested_value.strip()
+
+        litellm_params = payload.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            proxy_server_request = litellm_params.get("proxy_server_request")
+            if isinstance(proxy_server_request, dict):
+                body = proxy_server_request.get("body")
+                if isinstance(body, dict):
+                    for session_key in ("session_id", "conversation_id", "thread_id"):
+                        nested_value = body.get(session_key)
+                        if isinstance(nested_value, str) and nested_value.strip():
+                            return nested_value.strip()
+                    for nested_key in ("metadata", "litellm_metadata"):
+                        nested = body.get(nested_key)
+                        if isinstance(nested, dict):
+                            for session_key in ("session_id", "conversation_id", "thread_id"):
+                                nested_value = nested.get(session_key)
+                                if isinstance(nested_value, str) and nested_value.strip():
+                                    return nested_value.strip()
 
         source_identifier = PromptCachingDeploymentCheck._extract_source_identifier(
             payload=payload
@@ -127,27 +189,76 @@ class PromptCachingDeploymentCheck(CustomLogger):
 
         return None
 
+    @staticmethod
+    def _get_sticky_model_keys_for_success_event(
+        kwargs: Dict[str, Any], standard_logging_object: StandardLoggingPayload
+    ) -> List[str]:
+        """
+        Build candidate model keys used for sticky-routing writes.
+
+        Why:
+        - pre-call check often reads with router model alias (e.g. `claude-opus-4-6`)
+        - standard logging model may be provider-prefixed (e.g. `bedrock/us...`)
+        We write both to avoid key-space mismatch.
+        """
+        candidate_keys: List[str] = []
+
+        model_group = standard_logging_object.get("model_group")
+        if isinstance(model_group, str) and model_group.strip():
+            candidate_keys.append(model_group.strip())
+
+        kwargs_model = kwargs.get("model")
+        if isinstance(kwargs_model, str) and kwargs_model.strip():
+            candidate_keys.append(kwargs_model.strip())
+
+        logging_model = standard_logging_object.get("model")
+        if isinstance(logging_model, str) and logging_model.strip():
+            candidate_keys.append(logging_model.strip())
+
+        deduped_keys: List[str] = []
+        seen = set()
+        for key in candidate_keys:
+            if key not in seen:
+                deduped_keys.append(key)
+                seen.add(key)
+        return deduped_keys
+
     async def _async_get_sticky_model_id(
         self, model: str, session_id: str
     ) -> Optional[str]:
-        sticky_cache_key = self._get_sticky_cache_key(model=model, session_id=session_id)
-        sticky_result = await self.cache.async_get_cache(key=sticky_cache_key)
-        if isinstance(sticky_result, dict):
-            sticky_model_id = sticky_result.get("model_id")
-            if isinstance(sticky_model_id, str) and sticky_model_id:
-                return sticky_model_id
+        sticky_keys = [
+            self._get_sticky_cache_key(model=model, session_id=session_id),
+            self._get_session_sticky_cache_key(session_id=session_id),
+        ]
+        for sticky_cache_key in sticky_keys:
+            sticky_result = await self.cache.async_get_cache(key=sticky_cache_key)
+            if isinstance(sticky_result, dict):
+                sticky_model_id = sticky_result.get("model_id")
+                if isinstance(sticky_model_id, str) and sticky_model_id:
+                    return sticky_model_id
         return None
 
     async def _async_set_sticky_model_id(
-        self, model: str, session_id: str, model_id: str
+        self,
+        model: str,
+        session_id: str,
+        model_id: str,
+        route_record: Optional[Dict[str, Any]] = None,
     ) -> None:
-        sticky_cache_key = self._get_sticky_cache_key(model=model, session_id=session_id)
         sticky_ttl_seconds = self._get_sticky_ttl_seconds(session_id=session_id)
-        await self.cache.async_set_cache(
-            key=sticky_cache_key,
-            value={"model_id": model_id},
-            ttl=sticky_ttl_seconds,
-        )
+        sticky_value: Dict[str, Any] = {"model_id": model_id}
+        if isinstance(route_record, dict):
+            sticky_value.update(route_record)
+        sticky_keys = [
+            self._get_sticky_cache_key(model=model, session_id=session_id),
+            self._get_session_sticky_cache_key(session_id=session_id),
+        ]
+        for sticky_cache_key in sticky_keys:
+            await self.cache.async_set_cache(
+                key=sticky_cache_key,
+                value=sticky_value,
+                ttl=sticky_ttl_seconds,
+            )
 
     async def async_filter_deployments(
         self,
@@ -194,7 +305,40 @@ class PromptCachingDeploymentCheck(CustomLogger):
                 model_id = model_id_dict["model_id"]
                 for deployment in healthy_deployments:
                     if deployment["model_info"]["id"] == model_id:
+                        if session_id is not None:
+                            await self._async_set_sticky_model_id(
+                                model=model, session_id=session_id, model_id=model_id
+                            )
                         return [deployment]
+
+        # layer-1 session sticky routing:
+        # if session has no sticky route yet, pick a random deployment once and pin for 5 min
+        if (
+            session_id is not None
+            and messages is not None
+            and isinstance(healthy_deployments, list)
+            and len(healthy_deployments) > 0
+        ):
+            selected_deployment = random.choice(healthy_deployments)
+            selected_model_id = (
+                selected_deployment.get("model_info", {}) or {}
+            ).get("id")
+            if isinstance(selected_model_id, str) and selected_model_id:
+                route_record: Dict[str, Any] = {
+                    "selected_at_unix": int(time.time()),
+                    "selected_model_group": model,
+                    "selected_model_name": selected_deployment.get("model_name"),
+                    "selected_model_litellm": (
+                        selected_deployment.get("litellm_params", {}) or {}
+                    ).get("model"),
+                }
+                await self._async_set_sticky_model_id(
+                    model=model,
+                    session_id=session_id,
+                    model_id=selected_model_id,
+                    route_record=route_record,
+                )
+                return [selected_deployment]
 
         return healthy_deployments
 
@@ -249,9 +393,13 @@ class PromptCachingDeploymentCheck(CustomLogger):
             if isinstance(standard_metadata, dict):
                 session_id = self._extract_session_id({"metadata": standard_metadata})
         if session_id is not None:
-            await self._async_set_sticky_model_id(
-                model=model, session_id=session_id, model_id=model_id
+            sticky_model_keys = self._get_sticky_model_keys_for_success_event(
+                kwargs=kwargs, standard_logging_object=standard_logging_object
             )
+            for sticky_model_key in sticky_model_keys:
+                await self._async_set_sticky_model_id(
+                    model=sticky_model_key, session_id=session_id, model_id=model_id
+                )
 
         ## PROMPT CACHING - cache model id, if prompt caching valid prompt + provider
         if is_prompt_caching_valid_prompt(
