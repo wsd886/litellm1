@@ -278,9 +278,6 @@ class PromptCachingDeploymentCheck(CustomLogger):
                     healthy_deployments=healthy_deployments, model_id=sticky_model_id
                 )
                 if sticky_deployment is not None:
-                    await self._async_set_sticky_model_id(
-                        model=model, session_id=session_id, model_id=sticky_model_id
-                    )
                     return [sticky_deployment]
 
         if messages is not None and is_prompt_caching_valid_prompt(
@@ -306,9 +303,15 @@ class PromptCachingDeploymentCheck(CustomLogger):
                 for deployment in healthy_deployments:
                     if deployment["model_info"]["id"] == model_id:
                         if session_id is not None:
-                            await self._async_set_sticky_model_id(
-                                model=model, session_id=session_id, model_id=model_id
+                            existing_sticky_model_id = (
+                                await self._async_get_sticky_model_id(
+                                    model=model, session_id=session_id
+                                )
                             )
+                            if existing_sticky_model_id is None:
+                                await self._async_set_sticky_model_id(
+                                    model=model, session_id=session_id, model_id=model_id
+                                )
                         return [deployment]
 
         # layer-1 session sticky routing:
@@ -393,13 +396,17 @@ class PromptCachingDeploymentCheck(CustomLogger):
             if isinstance(standard_metadata, dict):
                 session_id = self._extract_session_id({"metadata": standard_metadata})
         if session_id is not None:
-            sticky_model_keys = self._get_sticky_model_keys_for_success_event(
-                kwargs=kwargs, standard_logging_object=standard_logging_object
+            existing_sticky_model_id = await self._async_get_sticky_model_id(
+                model=model, session_id=session_id
             )
-            for sticky_model_key in sticky_model_keys:
-                await self._async_set_sticky_model_id(
-                    model=sticky_model_key, session_id=session_id, model_id=model_id
+            if existing_sticky_model_id is None:
+                sticky_model_keys = self._get_sticky_model_keys_for_success_event(
+                    kwargs=kwargs, standard_logging_object=standard_logging_object
                 )
+                for sticky_model_key in sticky_model_keys:
+                    await self._async_set_sticky_model_id(
+                        model=sticky_model_key, session_id=session_id, model_id=model_id
+                    )
 
         ## PROMPT CACHING - cache model id, if prompt caching valid prompt + provider
         if is_prompt_caching_valid_prompt(
