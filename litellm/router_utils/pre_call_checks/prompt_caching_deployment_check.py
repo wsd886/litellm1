@@ -21,6 +21,7 @@ from ..prompt_caching_cache import PromptCachingCache
 
 class PromptCachingDeploymentCheck(CustomLogger):
     STICKY_ROUTING_TTL_SECONDS = 300
+    ROUTE_USAGE_TTL_SECONDS = 86400
 
     def __init__(self, cache: DualCache):
         self.cache = cache
@@ -32,10 +33,8 @@ class PromptCachingDeploymentCheck(CustomLogger):
 
     @staticmethod
     def _extract_source_identifier(payload: Dict[str, Any]) -> Optional[str]:
+        # Prefer API key scoped identifiers for account-level routing fairness.
         source_candidates = (
-            "user",
-            "user_id",
-            "end_user",
             "user_api_key_hash",
             "user_api_key_token",
             "user_api_key_alias",
@@ -43,6 +42,9 @@ class PromptCachingDeploymentCheck(CustomLogger):
             "user_api_key_team_id",
             "user_api_key",
             "api_key",
+            "end_user",
+            "user_id",
+            "user",
         )
 
         for source_key in source_candidates:
@@ -93,6 +95,22 @@ class PromptCachingDeploymentCheck(CustomLogger):
     def _get_sticky_ttl_seconds(session_id: str) -> int:
         _ = session_id
         return PromptCachingDeploymentCheck.STICKY_ROUTING_TTL_SECONDS
+
+    @staticmethod
+    def _get_source_hash(source_identifier: str) -> str:
+        return hashlib.sha256(source_identifier.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _get_recently_used_route_cache_key(
+        cls, model: str, source_identifier: str, model_id: str
+    ) -> str:
+        source_hash = cls._get_source_hash(source_identifier=source_identifier)
+        return f"deployment:{model}:source:{source_hash}:model:{model_id}:used_24h"
+
+    @staticmethod
+    def _get_route_usage_ttl_seconds(source_identifier: str) -> int:
+        _ = source_identifier
+        return PromptCachingDeploymentCheck.ROUTE_USAGE_TTL_SECONDS
 
     @staticmethod
     def _extract_session_id(payload: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -325,6 +343,117 @@ class PromptCachingDeploymentCheck(CustomLogger):
                 ttl=sticky_ttl_seconds,
             )
 
+    async def _async_has_recently_used_route(
+        self, model: str, source_identifier: str, model_id: str
+    ) -> bool:
+        cache_key = self._get_recently_used_route_cache_key(
+            model=model,
+            source_identifier=source_identifier,
+            model_id=model_id,
+        )
+        marker = await self.cache.async_get_cache(key=cache_key)
+        if marker is None:
+            return False
+        if isinstance(marker, dict):
+            marker_used = marker.get("used")
+            if isinstance(marker_used, bool):
+                return marker_used
+        return True
+
+    async def _async_mark_route_as_recently_used(
+        self, model: str, source_identifier: str, model_id: str
+    ) -> None:
+        cache_key = self._get_recently_used_route_cache_key(
+            model=model,
+            source_identifier=source_identifier,
+            model_id=model_id,
+        )
+        route_usage_ttl_seconds = self._get_route_usage_ttl_seconds(
+            source_identifier=source_identifier
+        )
+        await self.cache.async_set_cache(
+            key=cache_key,
+            value={
+                "used": True,
+                "selected_at_unix": int(time.time()),
+            },
+            ttl=route_usage_ttl_seconds,
+        )
+
+    async def _async_clear_recently_used_route_markers(
+        self, model: str, source_identifier: str, model_ids: List[str]
+    ) -> None:
+        deduped_model_ids = list(dict.fromkeys(model_ids))
+        for model_id in deduped_model_ids:
+            cache_key = self._get_recently_used_route_cache_key(
+                model=model,
+                source_identifier=source_identifier,
+                model_id=model_id,
+            )
+            await self.cache.async_delete_cache(key=cache_key)
+
+    async def _async_select_deployment_with_recently_used_markers(
+        self,
+        model: str,
+        healthy_deployments: List[dict],
+        source_identifier: Optional[str],
+    ) -> Optional[dict]:
+        deployments_with_model_ids: List[Dict[str, Any]] = []
+        for deployment in healthy_deployments:
+            deployment_model_id = deployment.get("model_info", {}).get("id")
+            if isinstance(deployment_model_id, str) and deployment_model_id:
+                deployments_with_model_ids.append(
+                    {
+                        "deployment": deployment,
+                        "model_id": deployment_model_id,
+                    }
+                )
+
+        if len(deployments_with_model_ids) == 0:
+            return None
+
+        if source_identifier is None:
+            return random.choice(
+                [row["deployment"] for row in deployments_with_model_ids]
+            )
+
+        is_recently_used_by_model_id: Dict[str, bool] = {}
+        for row in deployments_with_model_ids:
+            deployment_model_id = row["model_id"]
+            if deployment_model_id in is_recently_used_by_model_id:
+                continue
+            is_recently_used_by_model_id[deployment_model_id] = (
+                await self._async_has_recently_used_route(
+                    model=model,
+                    source_identifier=source_identifier,
+                    model_id=deployment_model_id,
+                )
+            )
+
+        unused_deployments = [
+            row["deployment"]
+            for row in deployments_with_model_ids
+            if is_recently_used_by_model_id.get(row["model_id"]) is False
+        ]
+
+        if len(unused_deployments) == 0:
+            await self._async_clear_recently_used_route_markers(
+                model=model,
+                source_identifier=source_identifier,
+                model_ids=[row["model_id"] for row in deployments_with_model_ids],
+            )
+            unused_deployments = [row["deployment"] for row in deployments_with_model_ids]
+
+        selected_deployment = random.choice(unused_deployments)
+        selected_model_id = selected_deployment.get("model_info", {}).get("id")
+        if isinstance(selected_model_id, str) and selected_model_id:
+            await self._async_mark_route_as_recently_used(
+                model=model,
+                source_identifier=source_identifier,
+                model_id=selected_model_id,
+            )
+        return selected_deployment
+
     async def async_filter_deployments(
         self,
         model: str,
@@ -333,6 +462,12 @@ class PromptCachingDeploymentCheck(CustomLogger):
         request_kwargs: Optional[dict] = None,
         parent_otel_span: Optional[Span] = None,
     ) -> List[dict]:
+        source_identifier: Optional[str] = None
+        if request_kwargs is not None:
+            source_identifier = self._extract_source_identifier(
+                payload=cast(Dict[str, Any], request_kwargs)
+            )
+
         session_id = self._extract_session_id(cast(Optional[Dict[str, Any]], request_kwargs))
         if session_id is not None:
             sticky_model_id = await self._async_get_sticky_model_id(
@@ -387,7 +522,16 @@ class PromptCachingDeploymentCheck(CustomLogger):
             and isinstance(healthy_deployments, list)
             and len(healthy_deployments) > 0
         ):
-            selected_deployment = random.choice(healthy_deployments)
+            selected_deployment = (
+                await self._async_select_deployment_with_recently_used_markers(
+                    model=model,
+                    healthy_deployments=healthy_deployments,
+                    source_identifier=source_identifier,
+                )
+            )
+            if selected_deployment is None:
+                return healthy_deployments
+
             selected_model_id = (
                 selected_deployment.get("model_info", {}) or {}
             ).get("id")
@@ -399,6 +543,8 @@ class PromptCachingDeploymentCheck(CustomLogger):
                     "selected_model_litellm": (
                         selected_deployment.get("litellm_params", {}) or {}
                     ).get("model"),
+                    "selected_model_usage_ttl_seconds": self.ROUTE_USAGE_TTL_SECONDS,
+                    "selected_model_strategy": "unused_24h_first_random",
                 }
                 await self._async_set_sticky_model_id(
                     model=model,
